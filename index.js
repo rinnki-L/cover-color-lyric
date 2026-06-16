@@ -1,70 +1,101 @@
 /**
  * 取色歌词 v1.0.0
- * 已播放 = 封面主色，未播放 = 默认色；频谱律动 + 平滑过渡。
+ * 已播放 = 封面主色（与主程序 color.ts 算法一致 + normalizeAccent 归一化），未播放 = 默认色；频谱律动 + 平滑过渡。
  * 关键约束：
  *  1. CSS 走 ctx.css.inject 并以 .echo-cover-color-* 命名空间，避免污染宿主。
  *  2. 桌面歌词颜色必须经 window.electron.desktopLyric.updateSettings。
  *  3. 频谱字段为 frame.bins / 订阅选项 binCount。
  *  4. ctx.player.currentTrack 为 ComputedRef，需 .value 解包。
+ *  5. 优先复用 ctx.stores.theme.coverColor（用户在主程序开了"主色随封面"时），与页面歌词完全一致。
  */
 const K = "cover-color-lyric:settings:v1";
 const C = { played: "#31cfa1", unplayed: "#7a7a7a" };
 const D = { enabled: true, transitionMs: 600, spectrumPulse: true, pulseIntensity: 0.35 };
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
-const h2r = h => {
-  if (typeof h !== "string") return [0, 0, 0];
-  let s = h.trim().replace("#", "");
-  if (s.length === 3) s = s.split("").map(c => c + c).join("");
-  if (s.length !== 6 || /[^0-9a-f]/i.test(s)) return [0, 0, 0];
-  return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16)];
+const clamp01 = v => Math.min(1, Math.max(0, v));
+const clamp255 = v => Math.min(255, Math.max(0, Math.round(v)));
+
+const hexToRgb = h => {
+  if (typeof h !== "string") return null;
+  let v = h.trim().replace("#", "");
+  if (v.length === 3) v = v.split("").map(c => c + c).join("");
+  if (!/^[0-9a-f]{6}$/i.test(v)) return null;
+  return { r: parseInt(v.slice(0, 2), 16), g: parseInt(v.slice(2, 4), 16), b: parseInt(v.slice(4, 6), 16) };
 };
-const r2h = (r, g, b) => "#" + [r, g, b].map(v => clamp(Math.round(v), 0, 255).toString(16).padStart(2, "0")).join("");
+
+const rgbToHex = (r, g, b) => `#${clamp255(r).toString(16).padStart(2, "0")}${clamp255(g).toString(16).padStart(2, "0")}${clamp255(b).toString(16).padStart(2, "0")}`;
+
+const rgbToHsl = (r, g, b) => {
+  const nr = r / 255, ng = g / 255, nb = b / 255;
+  const max = Math.max(nr, ng, nb), min = Math.min(nr, ng, nb);
+  const d = max - min, l = (max + min) / 2;
+  let h = 0, s = 0;
+  if (d !== 0) {
+    s = d / (1 - Math.abs(2 * l - 1));
+    if (max === nr) h = ((ng - nb) / d) % 6;
+    else if (max === ng) h = (nb - nr) / d + 2;
+    else h = (nr - ng) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return { h, s: clamp01(s), l: clamp01(l) };
+};
+
+const hslToRgb = (h, s, l) => {
+  const sat = clamp01(s), lit = clamp01(l);
+  const c = (1 - Math.abs(2 * lit - 1)) * sat;
+  const hue = ((h % 360) + 360) % 360;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = lit - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (hue < 60) [r, g, b] = [c, x, 0];
+  else if (hue < 120) [r, g, b] = [x, c, 0];
+  else if (hue < 180) [r, g, b] = [0, c, x];
+  else if (hue < 240) [r, g, b] = [0, x, c];
+  else if (hue < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return { r: clamp255((r + m) * 255), g: clamp255((g + m) * 255), b: clamp255((b + m) * 255) };
+};
+
+const h2r = h => { const o = hexToRgb(h); return o ? [o.r, o.g, o.b] : [0, 0, 0]; };
+const r2h = (r, g, b) => rgbToHex(r, g, b);
+
+const normalizeAccent = (hex, isDark) => {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return C.played;
+  const hsl = rgbToHsl(rgb.r, rgb.g, rgb.b);
+  if (hsl.s < 0.08) return C.played;
+  let s = hsl.s, l = hsl.l;
+  if (isDark) { s = Math.min(0.85, Math.max(0.45, s)); l = Math.min(0.72, Math.max(0.55, l)); }
+  else { s = Math.min(0.9, Math.max(0.55, s)); l = Math.min(0.55, Math.max(0.42, l)); }
+  const o = hslToRgb(hsl.h, s, l);
+  return rgbToHex(o.r, o.g, o.b);
+};
 
 const extractDominantColor = c => {
   const w = c.width, h = c.height;
   if (!w || !h) return null;
   let d; try { d = c.getContext("2d").getImageData(0, 0, w, h).data; } catch { return null; }
-  const buckets = new Map();
-  const BIN = 24;
+  const N = 18, bs = Array.from({ length: N }, () => ({ w: 0, r: 0, g: 0, b: 0 }));
+  let samples = 0, satSum = 0;
   for (let i = 0; i < d.length; i += 4) {
-    const r = d[i], g = d[i + 1], b = d[i + 2], a = d[i + 3];
-    if (a < 125) continue;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b);
-    const l = (max + min) / 2 / 255;
-    if (l < 0.12 || l > 0.94) continue;
-    const dm = max - min;
-    if (dm < 12) continue;
-    const s = dm / 255;
-    if (s < 0.18) continue;
-    let hue;
-    if (max === r) hue = ((g - b) / dm) % 6;
-    else if (max === g) hue = (b - r) / dm + 2;
-    else hue = (r - g) / dm + 4;
-    hue = (hue * 60 + 360) % 360;
-    const key = Math.floor(hue / BIN);
-    const cur = buckets.get(key) || { sSum: 0, lSum: 0, count: 0, weight: 0 };
-    cur.sSum += s; cur.lSum += l; cur.count++; cur.weight += s * s;
-    buckets.set(key, cur);
+    if (d[i + 3] < 200) continue;
+    const hsl = rgbToHsl(d[i], d[i + 1], d[i + 2]);
+    if (hsl.l < 0.15 || hsl.l > 0.92) continue;
+    if (hsl.s < 0.18) continue;
+    samples++; satSum += hsl.s;
+    const lScore = Math.max(0.15, 1 - Math.abs(hsl.l - 0.5) * 1.2);
+    const score = hsl.s * lScore;
+    const idx = Math.min(N - 1, Math.floor(hsl.h / (360 / N)));
+    const bk = bs[idx];
+    bk.w += score; bk.r += d[i] * score; bk.g += d[i + 1] * score; bk.b += d[i + 2] * score;
   }
-  if (!buckets.size) return null;
-  let best = null, bestW = 0;
-  for (const v of buckets.values()) if (v.weight > bestW) { bestW = v.weight; best = v; }
-  if (!best || best.count < 3) return null;
-  let domH = 0, dw = 0;
-  for (const [k, v] of buckets) if (v.weight > dw) { dw = v.weight; domH = k * BIN + BIN / 2; }
-  const avgS = best.sSum / best.count, avgL = best.lSum / best.count;
-  const s2 = clamp(avgS, 0.25, 1), l2 = clamp(avgL, 0.2, 0.8);
-  const q = l2 < 0.5 ? l2 * (1 + s2) : l2 + s2 - l2 * s2, p = 2 * l2 - q;
-  const hue2 = (t) => {
-    if (t < 0) t += 1; if (t > 1) t -= 1;
-    if (t < 1 / 6) return p + (q - p) * 6 * t;
-    if (t < 1 / 2) return q;
-    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-    return p;
-  };
-  const h3 = domH / 360;
-  return r2h(hue2(h3 + 1 / 3) * 255, hue2(h3) * 255, hue2(h3 - 1 / 3) * 255);
+  if (samples === 0 || satSum / samples < 0.15) return null;
+  let best = -1, bw = 0;
+  for (let i = 0; i < N; i++) if (bs[i].w > bw) { bw = bs[i].w; best = i; }
+  if (best < 0 || bw <= 0) return null;
+  const b = bs[best];
+  return rgbToHex(b.r / b.w, b.g / b.w, b.b / b.w);
 };
 
 const extractColorFromUrl = url => new Promise(resolve => {
@@ -73,7 +104,7 @@ const extractColorFromUrl = url => new Promise(resolve => {
   img.crossOrigin = "anonymous";
   let done = false;
   const finish = v => { if (!done) { done = true; resolve(v); } };
-  const timer = setTimeout(() => finish(null), 8000);
+  const timer = setTimeout(() => finish(null), 5000);
   img.onload = () => {
     clearTimeout(timer);
     try {
@@ -87,7 +118,21 @@ const extractColorFromUrl = url => new Promise(resolve => {
   try { img.src = url; } catch { clearTimeout(timer); finish(null); }
 });
 
-const buildPalette = main => main ? { played: main, unplayed: C.unplayed } : { ...C };
+const readThemeCoverColor = ctx => {
+  try {
+    const t = ctx.stores?.theme;
+    if (t && t.accentMode === "cover" && typeof t.coverColor === "string" && t.coverColor) {
+      return t.coverColor;
+    }
+  } catch {}
+  return null;
+};
+
+const isDarkMode = () => {
+  try { return document.documentElement.classList.contains("dark"); } catch { return false; }
+};
+
+const buildPalette = (raw, dark) => raw ? { played: normalizeAccent(raw, dark), unplayed: C.unplayed } : { ...C };
 
 const pushColors = (played, unplayed) => {
   const d = window.electron?.desktopLyric;
@@ -197,11 +242,17 @@ export async function activate(ctx) {
 
   const apply = async force => {
     if (!settings.enabled) return;
+    const dark = isDarkMode();
+    let raw = readThemeCoverColor(ctx);
     const url = await findCoverUrlAsync(ctx);
-    if (!url || (url === lastUrl && !force)) return;
-    lastUrl = url;
-    const main = await extractColorFromUrl(url);
-    const p = buildPalette(main);
+    if (url) lastUrl = url;
+    if (!raw) {
+      if (!lastUrl) return;
+      if (url === lastUrl && !force) return;
+      raw = await extractColorFromUrl(lastUrl);
+      if (!raw) return;
+    }
+    const p = buildPalette(raw, dark);
     const fp = palette.played;
     palette = p;
     transitioning = true;
@@ -215,6 +266,25 @@ export async function activate(ctx) {
 
   ctx.events.onTrackChange(() => setTimeout(() => apply(true), 500));
   setTimeout(() => apply(true), 1000);
+
+  let darkObserver = null;
+  try {
+    darkObserver = new MutationObserver(() => apply(true));
+    darkObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+  } catch {}
+
+  let stopThemeWatch = null;
+  try {
+    const { watch } = ctx.vue;
+    const theme = ctx.stores?.theme;
+    if (watch && theme) {
+      stopThemeWatch = watch(
+        () => [theme.coverColor, theme.accentMode, theme.isDark],
+        () => apply(true),
+        { deep: false }
+      );
+    }
+  } catch {}
 
   try { ctx.shortcuts?.register?.("CommandOrControl+Shift+L", () => {
     settings.enabled = !settings.enabled;
@@ -336,6 +406,8 @@ export async function activate(ctx) {
     try { cancelTrans?.(); } catch {}
     try { settingsDis?.(); } catch {}
     try { disposeCss?.(); } catch {}
+    try { darkObserver?.disconnect?.(); } catch {}
+    try { stopThemeWatch?.(); } catch {}
     try { document.getElementById("cover-color-lyric-vars")?.remove(); } catch {}
   });
 }
